@@ -1,15 +1,14 @@
-# build artifacts
+# build artifacts (compiled binaries — rebuild from source)
 attack0
 attack1
 attack2
+attacks/build/
 *.o
 *.out
 a.out
-# measurement outputs (keep dir, ignore large generated files)
-results/*.csv
-results/*.png
 # python
 __pycache__/
 *.pyc
 # os
 .DS_Store
+# NOTE: results/*.csv and results/*.png ARE committed (measurement evidence)

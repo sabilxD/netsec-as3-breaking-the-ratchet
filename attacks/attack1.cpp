@@ -1,6 +1,6 @@
 // attack1.cpp — Attack 1: one-time prekey exhaustion ("Prekey Pogo")
 // ------------------------------------------------------------------
-// OWNER: rollno2 (teammate). Placeholder stub so the submission tree matches the
+// OWNER: 23b1057 (teammate). Placeholder stub so the submission tree matches the
 // required structure. Implement the malicious client that repeatedly fetch_bundles
 // Bob to drain his OPK inventory, then demonstrates that no new session can start.
 //

